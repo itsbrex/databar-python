@@ -46,7 +46,7 @@ class DatabarInsufficientCreditsError(DatabarError):
 
 
 class DatabarGoneError(DatabarError):
-    """Raised on 410 — task results have expired (data only stored 1 hour)."""
+    """Raised on 410 — task results have expired (data stored for 24 hours)."""
 
 
 class DatabarValidationError(DatabarError):

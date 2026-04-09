@@ -77,6 +77,13 @@ enrichments = client.list_enrichments()
 # Search enrichments
 enrichments = client.list_enrichments(q="phone")
 
+# Paginated list (returns EnrichmentListResponse)
+page = client.list_enrichments(page=1, limit=50, category="Company Data")
+for e in page.items:
+    print(f"  [{e.id}] {e.name} — {e.price} credits")
+if page.has_next_page:
+    page2 = client.list_enrichments(page=2, limit=50)
+
 # Get full details (params, response fields)
 enrichment = client.get_enrichment(123)
 for param in enrichment.params:
@@ -88,6 +95,9 @@ data = client.poll_task(task.task_id)
 
 # Run single enrichment (sync convenience wrapper)
 data = client.run_enrichment_sync(123, {"email": "alice@example.com"})
+
+# Run with pagination (for list-style enrichments)
+data = client.run_enrichment_sync(123, {"query": "CEO"}, pages=3)
 
 # Bulk run
 data = client.run_enrichment_bulk_sync(123, [
@@ -130,17 +140,25 @@ results = client.run_waterfall_bulk_sync(
 ### Tables
 
 ```python
-# List tables
+# List and manage tables
 tables = client.list_tables()
-
-# Create a table
 table = client.create_table(name="My Leads", columns=["email", "name", "company"])
+client.rename_table(table.identifier, "Leads 2026")
+client.delete_table(table.identifier)
 
-# Get columns
+# Columns
 columns = client.get_columns(table.identifier)
+col = client.create_column(table.identifier, "Phone", type="text")
+client.rename_column(table.identifier, col.identifier, "Mobile")
+client.delete_column(table.identifier, col.identifier)
 
-# Get rows (paginated)
+# Get rows with optional server-side filter
+import json
 data = client.get_rows(table.identifier, page=1, per_page=500)
+filtered = client.get_rows(
+    table.identifier,
+    filter=json.dumps({"company": {"contains": "OpenAI"}}),
+)
 
 # Insert rows (auto-batched at 50)
 from databar import InsertRow, InsertOptions, DedupeOptions
@@ -158,15 +176,112 @@ print(f"Created: {len([r for r in response.results if r.action == 'created'])}")
 
 # Update rows by UUID
 from databar import BatchUpdateRow
-
 rows = [BatchUpdateRow(id=row_id, fields={"name": "Updated Name"})]
-response = client.patch_rows(table.identifier, rows)
+client.patch_rows(table.identifier, rows)
 
 # Upsert rows by key column
 from databar import UpsertRow
-
 rows = [UpsertRow(key={"email": "alice@example.com"}, fields={"name": "Alice"})]
-response = client.upsert_rows(table.identifier, rows)
+client.upsert_rows(table.identifier, rows)
+
+# Delete specific rows
+client.delete_rows(table.identifier, ["row-uuid-1", "row-uuid-2"])
+```
+
+### Enrichments on tables
+
+```python
+# Add an enrichment (with column mapping)
+result = client.add_enrichment(
+    table.identifier,
+    enrichment_id=123,
+    mapping={
+        "email": {"type": "mapping", "value": "email_col"},   # from column
+        "country": {"type": "simple", "value": "US"},          # static value
+    },
+    launch_strategy="run_on_click",  # or "run_on_update"
+)
+print(f"Added enrichment #{result.id}: {result.enrichment_name}")
+
+# Run it (run_strategy: run_all | run_empty | run_errors)
+status = client.run_table_enrichment(
+    table.identifier,
+    enrichment_id=str(result.id),
+    run_strategy="run_empty",
+)
+print(f"Processing {status.processing_rows} rows")
+```
+
+### Waterfalls on tables
+
+```python
+# Add a waterfall
+wf = client.add_waterfall(
+    table.identifier,
+    waterfall_identifier="email_getter",
+    enrichments=[833, 966],
+    mapping={"first_name": "first_name", "company": "company"},
+    email_verifier=10,
+)
+print(f"Added waterfall #{wf.id}: {wf.waterfall_name}")
+
+# List installed waterfalls
+installed = client.get_table_waterfalls(table.identifier)
+
+# Run the waterfall
+client.run_table_enrichment(table.identifier, enrichment_id=str(wf.id))
+```
+
+### Exporters
+
+```python
+# List available exporters
+exporters = client.list_exporters()              # plain list
+page = client.list_exporters(page=1, limit=50)  # paginated envelope
+
+# Get exporter details (params, authorization info)
+detail = client.get_exporter(exporters[0].id)
+print(detail.params, detail.authorization.required)
+
+# Add an exporter to a table
+result = client.add_exporter(
+    table.identifier,
+    exporter_id=detail.id,
+    mapping={"email": {"type": "mapping", "value": "email_col"}},
+)
+client.run_table_enrichment(table.identifier, enrichment_id=str(result.id))
+```
+
+### Connectors
+
+```python
+# Create a custom HTTP API connector
+connector = client.create_connector(
+    name="My Scoring API",
+    method="post",
+    url="https://api.example.com/v1/score",
+    headers=[{"name": "Authorization", "value": "Bearer sk-xxx"}],
+    body=[{"name": "domain", "value": ""}],
+    rate_limit=60,
+)
+
+# CRUD
+connectors = client.list_connectors()
+c = client.get_connector(connector.id)
+client.update_connector(connector.id, name="Updated API", method="post", url="https://...")
+client.delete_connector(connector.id)
+```
+
+### Folders
+
+```python
+# Organize tables in folders
+folder = client.create_folder("My Leads")
+folders = client.list_folders()
+client.rename_folder(folder.id, "Leads 2026")
+client.move_table_to_folder(table.identifier, folder_id=folder.id)
+client.move_table_to_folder(table.identifier)          # remove from folder
+client.delete_folder(folder.id)                        # tables move to root
 ```
 
 ### Error handling

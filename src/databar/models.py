@@ -1,9 +1,7 @@
 """
 Pydantic v2 models for the Databar API.
 
-All shapes are sourced directly from api-docs/api-reference/openapi.json.
-Where the TypeScript MCP client uses custom normalizations, these models
-match the actual API response, not the MCP adaptation.
+All shapes are sourced from the user_api OpenAPI definition (user_api/app/api/v1/).
 """
 
 from __future__ import annotations
@@ -15,6 +13,30 @@ from pydantic import BaseModel, Field
 
 
 # ===========================================================================
+# Pricing / Category (shared by Enrichment and Exporter)
+# ===========================================================================
+
+
+class PricingInfo(BaseModel):
+    """Describes how an enrichment is priced per request."""
+
+    type: str = Field(
+        description='"fixed" (flat per-request) or "per_parameter" (price × param value).'
+    )
+    parameter: Optional[str] = Field(
+        default=None,
+        description="Parameter name that multiplies the base price. Only present when type is per_parameter.",
+    )
+
+
+class CategoryInfo(BaseModel):
+    """A category tag attached to an enrichment."""
+
+    id: int
+    name: str
+
+
+# ===========================================================================
 # User
 # ===========================================================================
 
@@ -22,13 +44,14 @@ from pydantic import BaseModel, Field
 class User(BaseModel):
     """Authenticated user profile.
 
-    Fields: first_name, email, balance, plan.
+    Fields: first_name, email, balance, plan, workspace.
     """
 
     first_name: Optional[str] = None
     email: str
     balance: float
     plan: str
+    workspace: Optional[str] = None
 
 
 # ===========================================================================
@@ -52,6 +75,10 @@ class Choices(BaseModel):
     items: Optional[List[ChoiceItem]] = Field(
         default=None,
         description="Available choices (only present when mode is inline).",
+    )
+    endpoint: Optional[str] = Field(
+        default=None,
+        description="URL path to fetch choices from (only present when mode is remote).",
     )
 
 
@@ -90,12 +117,16 @@ class EnrichmentParam(BaseModel):
 class EnrichmentResponseField(BaseModel):
     """A field returned in the enrichment result data.
 
-    Fields: name, type_field.
+    Fields: name, display_name, type_field.
 
     Property aliases: .slug → .name, .label → .name.
     """
 
     name: str = Field(description="Field name as it appears in the result data.")
+    display_name: Optional[str] = Field(
+        default=None,
+        description="Human-readable display name for this field.",
+    )
     type_field: str = Field(description="Data type of this field.")
 
     @property
@@ -109,10 +140,20 @@ class EnrichmentResponseField(BaseModel):
         return self.name
 
 
+class PaginationInfo(BaseModel):
+    """Pagination metadata for a list-style enrichment."""
+
+    supported: bool = Field(description="Whether this enrichment supports pagination.")
+    per_page: Optional[int] = Field(
+        default=None,
+        description="Default rows per page (only present when supported is True).",
+    )
+
+
 class EnrichmentSummary(BaseModel):
     """Enrichment as returned by the list endpoint (no params/response_fields).
 
-    Fields: id, name, description, data_source, price, auth_method.
+    Fields: id, name, description, data_source, price, auth_method, pricing, category.
     """
 
     id: int
@@ -121,12 +162,15 @@ class EnrichmentSummary(BaseModel):
     data_source: str
     price: float
     auth_method: str
+    pricing: Optional[PricingInfo] = None
+    category: List[CategoryInfo] = Field(default_factory=list)
 
 
 class Enrichment(EnrichmentSummary):
-    """Full enrichment detail including params and response fields.
+    """Full enrichment detail including params, response fields and pagination info.
 
-    Fields: id, name, description, data_source, price, auth_method, params, response_fields.
+    Fields: id, name, description, data_source, price, auth_method, pricing, category,
+    params, response_fields, pagination.
 
     Usage::
 
@@ -137,6 +181,28 @@ class Enrichment(EnrichmentSummary):
 
     params: Optional[List[EnrichmentParam]] = None
     response_fields: Optional[List[EnrichmentResponseField]] = None
+    pagination: Optional[PaginationInfo] = None
+
+
+class EnrichmentListResponse(BaseModel):
+    """Paginated response returned by list_enrichments(page=N).
+
+    Fields: items, page, limit, has_next_page, total_count.
+
+    Usage::
+
+        resp = client.list_enrichments(page=1, limit=50)
+        for e in resp.items:
+            print(e.id, e.name)
+        if resp.has_next_page:
+            resp2 = client.list_enrichments(page=2, limit=50)
+    """
+
+    items: List[EnrichmentSummary]
+    page: int
+    limit: int
+    has_next_page: bool
+    total_count: int
 
 
 class ChoicesResponse(BaseModel):
@@ -146,6 +212,13 @@ class ChoicesResponse(BaseModel):
     page: int
     limit: int
     has_next_page: bool
+    total_count: int = 0
+
+
+class PaginationOptions(BaseModel):
+    """Pagination options for run / bulk-run requests on list-style enrichments."""
+
+    pages: int = Field(default=1, ge=1, le=100, description="Number of pages to fetch.")
 
 
 # ===========================================================================
@@ -156,8 +229,10 @@ class ChoicesResponse(BaseModel):
 class TaskStatus(str, Enum):
     PROCESSING = "processing"
     COMPLETED = "completed"
+    PARTIALLY_COMPLETED = "partially_completed"
     FAILED = "failed"
     GONE = "gone"
+    NO_DATA = "no_data"
 
 
 class RunResponse(BaseModel):
@@ -170,16 +245,19 @@ class RunResponse(BaseModel):
 class TaskResponse(BaseModel):
     """Returned by GET /v1/tasks/{task_id}.
 
-    The backend currently uses 'request_id' as the field name; this model
-    accepts both 'task_id' and 'request_id' so it works before and after
-    the backend renames the field.
+    The backend also populates `request_id` (deprecated alias) so both names are accepted.
+    Statuses: processing, no_data, completed, partially_completed, failed, gone.
+
+    Task data is stored for **24 hours**. After that status becomes 'gone'.
     """
 
-    task_id: str = Field(
-        description="Unique identifier of the task.",
+    task_id: str = Field(description="Unique identifier of the task.")
+    request_id: Optional[str] = Field(
+        default=None,
+        description="Deprecated alias for task_id. Same value.",
     )
     status: str = Field(
-        description="Current status: processing, completed, failed, or gone."
+        description="Current status: processing, completed, partially_completed, failed, or gone."
     )
     data: Optional[Union[List[Any], Dict[str, Any]]] = Field(
         default=None,
@@ -245,7 +323,7 @@ class Waterfall(BaseModel):
 class Table(BaseModel):
     """A Databar table.
 
-    Fields: identifier, name, created_at, updated_at.
+    Fields: identifier, name, created_at, updated_at, workspace_identifier, table_url.
 
     Property aliases: .id → .identifier, .uuid → .identifier.
 
@@ -259,6 +337,8 @@ class Table(BaseModel):
     name: str
     created_at: str
     updated_at: str
+    workspace_identifier: Optional[str] = None
+    table_url: Optional[str] = None
 
     @property
     def id(self) -> str:
@@ -274,27 +354,101 @@ class Table(BaseModel):
 class Column(BaseModel):
     """A column defined on a table.
 
-    Fields: identifier, internal_name, name, type_of_value, data_processor_id.
+    Fields: identifier, internal_name, additional_intenal_name, name, type_of_value, data_processor_id.
+
+    Note: 'additional_intenal_name' preserves the upstream typo for wire compatibility.
     """
 
     identifier: str = Field(description="Column UUID.")
     internal_name: str
+    additional_intenal_name: Optional[str] = None
     name: str = Field(description="Human-readable column name.")
     type_of_value: str
     data_processor_id: Optional[int] = None
 
 
+class CreateColumnResponse(BaseModel):
+    """Response from creating or renaming a column."""
+
+    identifier: str
+    name: str
+    type_of_value: str
+
+
 class TableEnrichment(BaseModel):
-    """An enrichment configured on a table.
+    """An enrichment configured on a table (from get_table_enrichments).
 
     Fields: id, name.
 
-    The id here is the TABLE-ENRICHMENT id — use it with run_table_enrichment(),
+    The id is the TABLE-ENRICHMENT id — use it with run_table_enrichment(),
     not the enrichment catalog id.
     """
 
     id: int
     name: str
+
+
+class AddEnrichmentResponse(BaseModel):
+    """Response from adding an enrichment to a table (add_enrichment).
+
+    Fields: id, enrichment_name.
+
+    Note: id here is the table-enrichment id, not the enrichment catalog id.
+    Use it with run_table_enrichment().
+    """
+
+    id: int
+    enrichment_name: str
+
+
+class AddWaterfallResponse(BaseModel):
+    """Response from adding a waterfall to a table (add_waterfall).
+
+    Fields: id, waterfall_name.
+    """
+
+    id: int
+    waterfall_name: str
+
+
+class InstalledWaterfall(BaseModel):
+    """A waterfall installed on a table.
+
+    Fields: id, waterfall_name.
+    """
+
+    id: int
+    waterfall_name: str
+
+
+class AddExporterResponse(BaseModel):
+    """Response from adding an exporter to a table (add_exporter).
+
+    Fields: id, exporter_name.
+    """
+
+    id: int
+    exporter_name: str
+
+
+class InstalledExporter(BaseModel):
+    """An exporter installed on a table.
+
+    Fields: id, name.
+    """
+
+    id: int
+    name: str
+
+
+class RunEnrichmentResponse(BaseModel):
+    """Response from triggering a table enrichment or waterfall run.
+
+    Fields: status, processing_rows.
+    """
+
+    status: str
+    processing_rows: Optional[int] = None
 
 
 # ===========================================================================
@@ -412,3 +566,151 @@ class UpsertResultItem(BaseModel):
 
 class UpsertResponse(BaseModel):
     results: List[UpsertResultItem]
+
+
+# ===========================================================================
+# Exporters
+# ===========================================================================
+
+
+class Exporter(BaseModel):
+    """An exporter (CRM/destination integration) as returned by the list endpoint.
+
+    Fields: id, name, description, dataset.
+
+    Usage::
+
+        exporters = client.list_exporters()
+        detail = client.get_exporter(exporters[0].id)
+    """
+
+    id: int
+    name: str
+    description: str
+    dataset: int
+
+
+class ExporterListResponse(BaseModel):
+    """Paginated response returned by list_exporters(page=N).
+
+    Fields: items, page, limit, has_next_page, total_count.
+    """
+
+    items: List[Exporter]
+    page: int
+    limit: int
+    has_next_page: bool
+    total_count: int
+
+
+class ExporterParam(BaseModel):
+    """A parameter for an exporter.
+
+    Fields: name, is_required, type_field, description, choices.
+    """
+
+    name: str
+    is_required: bool
+    type_field: str
+    description: str
+    choices: Optional[Choices] = None
+
+
+class ExporterResponseField(BaseModel):
+    """A field in the exporter result."""
+
+    name: str
+    display_name: Optional[str] = None
+    type_field: str
+
+
+class Connection(BaseModel):
+    """A stored API key or OAuth connection for an exporter."""
+
+    id: int
+    name: str
+    type: str
+
+
+class AuthorizationInfo(BaseModel):
+    """Authorization requirements and available connections for an exporter."""
+
+    required: bool
+    connections: List[Connection] = Field(default_factory=list)
+
+
+class ExporterDetail(Exporter):
+    """Full exporter detail including params, response fields and authorization info.
+
+    Fields: id, name, description, dataset, params, response_fields, authorization.
+    """
+
+    params: List[ExporterParam] = Field(default_factory=list)
+    response_fields: List[ExporterResponseField] = Field(default_factory=list)
+    authorization: AuthorizationInfo
+
+
+# ===========================================================================
+# Connectors
+# ===========================================================================
+
+
+class NameValue(BaseModel):
+    """A name/value pair used in connector headers, parameters, and body fields."""
+
+    name: str
+    value: str = ""
+
+
+class Connector(BaseModel):
+    """A custom HTTP API connector registered in the workspace.
+
+    Fields: id, name, type, method, url, headers, parameters, body,
+    body_template, rate_limit, max_concurrency, created_at.
+
+    Usage::
+
+        connector = client.create_connector(
+            name="My Scoring API",
+            method="post",
+            url="https://api.example.com/v1/score",
+            headers=[{"name": "Authorization", "value": "Bearer sk-xxx"}],
+            body=[{"name": "domain", "value": ""}],
+        )
+    """
+
+    id: int
+    name: str
+    type: str = "enrichment"
+    method: str
+    url: str
+    headers: List[NameValue] = Field(default_factory=list)
+    parameters: List[NameValue] = Field(default_factory=list)
+    body: List[NameValue] = Field(default_factory=list)
+    body_template: Optional[str] = None
+    rate_limit: Optional[int] = None
+    max_concurrency: Optional[int] = None
+    created_at: Optional[str] = None
+
+
+# ===========================================================================
+# Folders
+# ===========================================================================
+
+
+class Folder(BaseModel):
+    """A folder for organizing tables in the workspace.
+
+    Fields: id, name, created_at, updated_at, table_count.
+
+    Usage::
+
+        folder = client.create_folder("Leads")
+        client.move_table_to_folder(table.identifier, folder.id)
+    """
+
+    id: int
+    name: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    table_count: Optional[int] = None

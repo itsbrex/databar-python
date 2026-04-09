@@ -16,6 +16,11 @@ Quick start::
     # Work with tables
     tables = client.list_tables()
     rows = client.get_rows(tables[0].identifier)
+
+    # Manage exporters, connectors and folders
+    exporters = client.list_exporters()
+    folder = client.create_folder("My Leads")
+    client.move_table_to_folder(tables[0].identifier, folder.id)
 """
 
 from .client import DatabarClient
@@ -31,34 +36,66 @@ from .exceptions import (
     DatabarValidationError,
 )
 from .models import (
-    BatchInsertResponse,
-    BatchUpdateResponse,
-    BatchUpdateRow,
+    # Pricing / Category
+    PricingInfo,
+    CategoryInfo,
+    # User
+    User,
+    # Enrichments
     ChoiceItem,
     Choices,
-    ChoicesResponse,
-    Column,
-    DedupeOptions,
-    Enrichment,
     EnrichmentParam,
     EnrichmentResponseField,
+    PaginationInfo,
+    PaginationOptions,
     EnrichmentSummary,
-    InsertOptions,
-    InsertRow,
-    RowsResponse,
+    Enrichment,
+    EnrichmentListResponse,
+    ChoicesResponse,
+    # Tasks
     RunResponse,
-    Table,
-    TableEnrichment,
     TaskResponse,
     TaskStatus,
-    UpsertResponse,
-    UpsertRow,
-    User,
+    # Waterfalls
     Waterfall,
     WaterfallEnrichment,
+    # Tables
+    Table,
+    Column,
+    CreateColumnResponse,
+    TableEnrichment,
+    AddEnrichmentResponse,
+    AddWaterfallResponse,
+    InstalledWaterfall,
+    AddExporterResponse,
+    InstalledExporter,
+    RunEnrichmentResponse,
+    # Rows
+    RowsResponse,
+    InsertRow,
+    InsertOptions,
+    DedupeOptions,
+    BatchInsertResponse,
+    BatchUpdateRow,
+    BatchUpdateResponse,
+    UpsertRow,
+    UpsertResponse,
+    # Exporters
+    Exporter,
+    ExporterListResponse,
+    ExporterParam,
+    ExporterResponseField,
+    Connection,
+    AuthorizationInfo,
+    ExporterDetail,
+    # Connectors
+    NameValue,
+    Connector,
+    # Folders
+    Folder,
 )
 
-__version__ = "2.0.9"
+__version__ = "2.1.0"
 __all__ = [
     "DatabarClient",
     # exceptions
@@ -71,23 +108,41 @@ __all__ = [
     "DatabarRateLimitError",
     "DatabarTaskFailedError",
     "DatabarTimeoutError",
-    # models
+    # pricing / category
+    "PricingInfo",
+    "CategoryInfo",
+    # user
     "User",
-    "Enrichment",
+    # enrichments
     "EnrichmentSummary",
+    "Enrichment",
+    "EnrichmentListResponse",
     "EnrichmentParam",
     "EnrichmentResponseField",
+    "PaginationInfo",
+    "PaginationOptions",
     "ChoiceItem",
     "Choices",
     "ChoicesResponse",
+    # tasks
     "RunResponse",
     "TaskResponse",
     "TaskStatus",
+    # waterfalls
     "Waterfall",
     "WaterfallEnrichment",
+    # tables
     "Table",
     "Column",
+    "CreateColumnResponse",
     "TableEnrichment",
+    "AddEnrichmentResponse",
+    "AddWaterfallResponse",
+    "InstalledWaterfall",
+    "AddExporterResponse",
+    "InstalledExporter",
+    "RunEnrichmentResponse",
+    # rows
     "RowsResponse",
     "InsertRow",
     "InsertOptions",
@@ -97,4 +152,17 @@ __all__ = [
     "BatchUpdateResponse",
     "UpsertRow",
     "UpsertResponse",
+    # exporters
+    "Exporter",
+    "ExporterListResponse",
+    "ExporterParam",
+    "ExporterResponseField",
+    "Connection",
+    "AuthorizationInfo",
+    "ExporterDetail",
+    # connectors
+    "NameValue",
+    "Connector",
+    # folders
+    "Folder",
 ]

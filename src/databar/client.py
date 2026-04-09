@@ -1,16 +1,31 @@
 """
 DatabarClient — the core SDK client for api.databar.ai/v1.
 
-Covers all 19 endpoints with:
+Covers all endpoints with:
   - Exponential backoff retry (3 attempts, skip 4xx except 429)
-  - Async task polling with configurable timeout
+  - Async task polling with configurable timeout; handles partially_completed
   - Auto-batching for row operations (50 per request, API limit)
   - Sync convenience wrappers that submit + poll in one call
   - Typed exceptions for every error condition
   - API key auto-read from DATABAR_API_KEY env var
 
-Behavior is modeled on the TypeScript MCP reference implementation
-in databar_mcp/src/databar-client.ts.
+Endpoint groups:
+  - User:        get_user
+  - Tasks:       get_task, poll_task
+  - Enrichments: list_enrichments, get_enrichment, run_enrichment[_bulk][_sync],
+                 get_param_choices
+  - Waterfalls:  list_waterfalls, get_waterfall, run_waterfall[_bulk][_sync]
+  - Tables:      create_table, list_tables, delete_table, rename_table,
+                 get_columns, create_column, rename_column, delete_column,
+                 get_table_enrichments, add_enrichment, run_table_enrichment,
+                 add_waterfall, get_table_waterfalls,
+                 add_exporter, get_table_exporters,
+                 get_rows, create_rows, patch_rows, upsert_rows, delete_rows
+  - Exporters:   list_exporters, get_exporter
+  - Connectors:  list_connectors, get_connector, create_connector,
+                 update_connector, delete_connector
+  - Folders:     create_folder, list_folders, rename_folder, delete_folder,
+                 move_table_to_folder
 """
 
 from __future__ import annotations
@@ -18,7 +33,7 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import httpx
 
@@ -34,15 +49,34 @@ from .exceptions import (
     DatabarValidationError,
 )
 from .models import (
+    AddEnrichmentResponse,
+    AddExporterResponse,
+    AddWaterfallResponse,
+    AuthorizationInfo,
     BatchInsertResponse,
     BatchUpdateResponse,
     BatchUpdateRow,
     ChoicesResponse,
     Column,
+    Connection,
+    Connector,
+    CreateColumnResponse,
+    DedupeOptions,
     Enrichment,
+    EnrichmentListResponse,
     EnrichmentSummary,
+    Exporter,
+    ExporterDetail,
+    ExporterListResponse,
+    ExporterParam,
+    ExporterResponseField,
+    Folder,
     InsertOptions,
     InsertRow,
+    InstalledExporter,
+    InstalledWaterfall,
+    NameValue,
+    RunEnrichmentResponse,
     RowsResponse,
     RunResponse,
     Table,
@@ -153,7 +187,7 @@ class DatabarClient:
             )
         if status == 410:
             raise DatabarGoneError(
-                "Task data has expired. Results are only stored for 1 hour after "
+                "Task data has expired. Results are only stored for 24 hours after "
                 "completion. Re-run the enrichment to fetch fresh data.",
                 status_code=status,
                 response_body=body,
@@ -202,7 +236,6 @@ class DatabarClient:
                 self._raise_for_response(response)
                 return response.json() if response.content else None
             except (DatabarRateLimitError, DatabarError) as exc:
-                # Retry on 429 and 5xx; don't retry other 4xx
                 if isinstance(exc, DatabarError) and exc.status_code is not None:
                     if 400 <= exc.status_code < 500 and exc.status_code != 429:
                         raise
@@ -229,15 +262,17 @@ class DatabarClient:
         """
         Poll until a task completes or times out.
 
-        Returns the task's data payload on success.
-        Raises DatabarTaskFailedError or DatabarTimeoutError otherwise.
+        Returns the task's data payload on success (status completed or partially_completed).
+        Raises DatabarTaskFailedError, DatabarGoneError or DatabarTimeoutError otherwise.
+
+        Task data is stored for 24 hours. After that the status becomes 'gone'.
         """
         for _ in range(self._max_poll_attempts):
             time.sleep(self._poll_interval_s)
             task = self.get_task(task_id)
             status = task.status.lower()
 
-            if status in ("completed", "success"):
+            if status in ("completed", "success", "partially_completed"):
                 return task.data
 
             if status in ("failed", "error"):
@@ -253,6 +288,7 @@ class DatabarClient:
                     "Task data has expired. Re-run the enrichment to get fresh results.",
                     response_body=task.model_dump(),
                 )
+            # "processing", "no_data" → continue polling
 
         raise DatabarTimeoutError(task_id, self._max_poll_attempts, self._poll_interval_s)
 
@@ -269,10 +305,48 @@ class DatabarClient:
     # Enrichments
     # -----------------------------------------------------------------------
 
-    def list_enrichments(self, q: Optional[str] = None) -> List[EnrichmentSummary]:
-        """List all available enrichments, optionally filtered by search query."""
-        params = {"q": q} if q else None
-        data = self._request("GET", "/enrichments/", params=params)
+    def list_enrichments(
+        self,
+        q: Optional[str] = None,
+        page: Optional[int] = None,
+        limit: int = 50,
+        authorized_only: bool = True,
+        category: Optional[str] = None,
+    ) -> Union[List[EnrichmentSummary], EnrichmentListResponse]:
+        """
+        List available enrichments.
+
+        Without ``page`` (default): returns a plain list of :class:`EnrichmentSummary`.
+        With ``page``: returns a paginated :class:`EnrichmentListResponse` envelope.
+
+        Args:
+            q: Search query to filter results.
+            page: Page number for paginated results. When set, returns EnrichmentListResponse.
+            limit: Items per page (only used with page). Max 500.
+            authorized_only: Only show enrichments the user has access to (default True).
+            category: Filter by category name (e.g. 'Company Data').
+        """
+        params: Dict[str, Any] = {}
+        if not authorized_only:
+            params["authorized_only"] = "false"
+        if q:
+            params["q"] = q
+        if page is not None:
+            params["page"] = page
+            params["limit"] = limit
+        if category:
+            params["category"] = category
+
+        data = self._request("GET", "/enrichments/", params=params if params else None)
+
+        if page is not None:
+            return EnrichmentListResponse(
+                items=[EnrichmentSummary.model_validate(e) for e in data.get("items", data)],
+                page=data["page"],
+                limit=data["limit"],
+                has_next_page=data["has_next_page"],
+                total_count=data["total_count"],
+            )
         return [EnrichmentSummary.model_validate(e) for e in data]
 
     def get_enrichment(self, enrichment_id: int) -> Enrichment:
@@ -280,30 +354,64 @@ class DatabarClient:
         data = self._request("GET", f"/enrichments/{enrichment_id}")
         return Enrichment.model_validate(data)
 
-    def run_enrichment(self, enrichment_id: int, params: Dict[str, Any]) -> RunResponse:
-        """Submit an enrichment run. Returns a task — use poll_task() or run_enrichment_sync()."""
-        data = self._request("POST", f"/enrichments/{enrichment_id}/run", json={"params": params})
+    def run_enrichment(
+        self,
+        enrichment_id: int,
+        params: Dict[str, Any],
+        pages: Optional[int] = None,
+    ) -> RunResponse:
+        """
+        Submit an enrichment run. Returns a task — use poll_task() or run_enrichment_sync().
+
+        Args:
+            enrichment_id: The enrichment to run.
+            params: Enrichment input parameters.
+            pages: For list-style enrichments, number of result pages to fetch.
+        """
+        body: Dict[str, Any] = {"params": params}
+        if pages is not None and pages > 1:
+            body["pagination"] = {"pages": pages}
+        data = self._request("POST", f"/enrichments/{enrichment_id}/run", json=body)
         return RunResponse.model_validate(data)
 
     def run_enrichment_bulk(
-        self, enrichment_id: int, params: List[Dict[str, Any]]
+        self,
+        enrichment_id: int,
+        params: List[Dict[str, Any]],
+        pages: Optional[int] = None,
     ) -> RunResponse:
-        """Submit a bulk enrichment run for multiple inputs."""
-        data = self._request("POST", f"/enrichments/{enrichment_id}/bulk-run", json={"params": params})
+        """
+        Submit a bulk enrichment run for multiple inputs.
+
+        Args:
+            enrichment_id: The enrichment to run.
+            params: List of per-row input parameter dicts.
+            pages: For list-style enrichments, pages to fetch per row.
+        """
+        body: Dict[str, Any] = {"params": params}
+        if pages is not None and pages > 1:
+            body["pagination"] = {"pages": pages}
+        data = self._request("POST", f"/enrichments/{enrichment_id}/bulk-run", json=body)
         return RunResponse.model_validate(data)
 
     def run_enrichment_sync(
-        self, enrichment_id: int, params: Dict[str, Any]
+        self,
+        enrichment_id: int,
+        params: Dict[str, Any],
+        pages: Optional[int] = None,
     ) -> Any:
         """Submit and poll an enrichment, returning final data when complete."""
-        task = self.run_enrichment(enrichment_id, params)
+        task = self.run_enrichment(enrichment_id, params, pages=pages)
         return self.poll_task(task.task_id)
 
     def run_enrichment_bulk_sync(
-        self, enrichment_id: int, params: List[Dict[str, Any]]
+        self,
+        enrichment_id: int,
+        params: List[Dict[str, Any]],
+        pages: Optional[int] = None,
     ) -> Any:
         """Submit and poll a bulk enrichment, returning final data when complete."""
-        task = self.run_enrichment_bulk(enrichment_id, params)
+        task = self.run_enrichment_bulk(enrichment_id, params, pages=pages)
         return self.poll_task(task.task_id)
 
     def get_param_choices(
@@ -405,21 +513,24 @@ class DatabarClient:
         return self.poll_task(task.task_id)
 
     # -----------------------------------------------------------------------
-    # Tables
+    # Tables — CRUD
     # -----------------------------------------------------------------------
 
     def create_table(
         self,
         name: Optional[str] = None,
         columns: Optional[List[str]] = None,
+        rows: int = 0,
     ) -> Table:
         """
         Create a new empty table.
 
-        name defaults to 'New empty table'.
-        columns pre-defines column names; defaults to column1/column2/column3.
+        Args:
+            name: Table name. Defaults to 'New empty table'.
+            columns: Pre-defined column names. Defaults to column1/column2/column3.
+            rows: Number of empty placeholder rows to create (default 0).
         """
-        payload: Dict[str, Any] = {}
+        payload: Dict[str, Any] = {"rows": rows}
         if name is not None:
             payload["name"] = name
         if columns is not None:
@@ -432,10 +543,68 @@ class DatabarClient:
         data = self._request("GET", "/table/")
         return [Table.model_validate(t) for t in data]
 
+    def delete_table(self, table_uuid: str) -> None:
+        """Permanently delete a table and all its rows."""
+        self._request("DELETE", f"/table/{table_uuid}")
+
+    def rename_table(self, table_uuid: str, name: str) -> Table:
+        """Rename a table."""
+        data = self._request("PATCH", f"/table/{table_uuid}", json={"name": name})
+        return Table.model_validate(data)
+
+    # -----------------------------------------------------------------------
+    # Tables — Columns
+    # -----------------------------------------------------------------------
+
     def get_columns(self, table_uuid: str) -> List[Column]:
         """Get all columns defined on a table."""
         data = self._request("GET", f"/table/{table_uuid}/columns")
         return [Column.model_validate(c) for c in data]
+
+    def create_column(
+        self,
+        table_uuid: str,
+        name: str,
+        type: str = "text",
+        config: Optional[Dict[str, Any]] = None,
+    ) -> CreateColumnResponse:
+        """
+        Add a new column to a table.
+
+        Args:
+            table_uuid: UUID of the table.
+            name: Column display name.
+            type: Column type (default 'text').
+            config: Column configuration dict (default empty).
+        """
+        data = self._request(
+            "POST",
+            f"/table/{table_uuid}/columns",
+            json={"name": name, "type": type, "config": config or {}},
+        )
+        return CreateColumnResponse.model_validate(data)
+
+    def rename_column(
+        self,
+        table_uuid: str,
+        column_id: str,
+        name: str,
+    ) -> CreateColumnResponse:
+        """Rename an existing column."""
+        data = self._request(
+            "PATCH",
+            f"/table/{table_uuid}/columns/{column_id}",
+            json={"name": name},
+        )
+        return CreateColumnResponse.model_validate(data)
+
+    def delete_column(self, table_uuid: str, column_id: str) -> None:
+        """Delete a column from a table."""
+        self._request("DELETE", f"/table/{table_uuid}/columns/{column_id}")
+
+    # -----------------------------------------------------------------------
+    # Tables — Enrichments
+    # -----------------------------------------------------------------------
 
     def get_table_enrichments(self, table_uuid: str) -> List[TableEnrichment]:
         """List enrichments configured on a table."""
@@ -447,7 +616,8 @@ class DatabarClient:
         table_uuid: str,
         enrichment_id: int,
         mapping: Dict[str, Any],
-    ) -> TableEnrichment:
+        launch_strategy: Literal["run_on_click", "run_on_update"] = "run_on_click",
+    ) -> AddEnrichmentResponse:
         """
         Add an enrichment to a table with a parameter-to-column mapping.
 
@@ -459,12 +629,16 @@ class DatabarClient:
           - ``{"type": "simple", "value": "<static-value>"}``
             — uses the same hardcoded value for every row.
 
-        Returns the newly added :class:`TableEnrichment` (with ``id`` and ``name``),
-        resolved by diffing enrichments before and after the add.
+        Args:
+            launch_strategy: 'run_on_click' (manual) or 'run_on_update' (auto-trigger
+                when mapped input columns change).
+
+        Returns:
+            :class:`AddEnrichmentResponse` with ``id`` (table-enrichment id) and
+            ``enrichment_name``. Use ``id`` with run_table_enrichment().
         """
-        # Auto-resolve column names → UUIDs for mapping-type entries
         resolved_mapping: Dict[str, Any] = {}
-        column_map: Optional[Dict[str, str]] = None  # name → uuid, built lazily
+        column_map: Optional[Dict[str, str]] = None
 
         for param, entry in mapping.items():
             if not isinstance(entry, dict) or entry.get("type") != "mapping":
@@ -472,54 +646,143 @@ class DatabarClient:
                 continue
 
             value = entry.get("value", "")
-            # Looks like a UUID already — 8-4-4-4-12 hex pattern
             if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", str(value), re.IGNORECASE):
                 resolved_mapping[param] = entry
                 continue
 
-            # Build the column name→uuid map once
             if column_map is None:
                 columns = self.get_columns(table_uuid)
                 column_map = {c.name: c.identifier for c in columns}
 
             uuid = column_map.get(value)
             if uuid is None:
-                # Not a known column name — pass through and let the API surface the error
                 resolved_mapping[param] = entry
             else:
                 resolved_mapping[param] = {**entry, "value": uuid}
 
-        # Snapshot existing enrichment IDs so we can detect the new one
-        before_ids = {e.id for e in self.get_table_enrichments(table_uuid)}
-
-        payload = {"enrichment": enrichment_id, "mapping": resolved_mapping}
-        self._request("POST", f"/table/{table_uuid}/add-enrichment", json=payload)
-
-        # Fetch updated list and return the newly created TableEnrichment
-        after = self.get_table_enrichments(table_uuid)
-        new_enrichments = [e for e in after if e.id not in before_ids]
-        if new_enrichments:
-            return new_enrichments[-1]
-
-        # Fallback: return the last enrichment in the list if we can't detect which is new
-        if after:
-            return after[-1]
-
-        raise DatabarError("Enrichment was added but could not be retrieved. Use get_table_enrichments() to fetch it manually.")
+        payload: Dict[str, Any] = {
+            "enrichment": enrichment_id,
+            "mapping": resolved_mapping,
+            "launch_strategy": launch_strategy,
+        }
+        data = self._request("POST", f"/table/{table_uuid}/add-enrichment", json=payload)
+        return AddEnrichmentResponse.model_validate(data)
 
     def run_table_enrichment(
         self,
         table_uuid: str,
         enrichment_id: str,
-        run_strategy: Optional[str] = None,
-    ) -> Any:
-        """Trigger an enrichment to run on all rows in a table."""
-        params = {"run_strategy": run_strategy} if run_strategy else None
-        return self._request(
+        run_strategy: Literal["run_all", "run_empty", "run_errors"] = "run_all",
+        row_ids: Optional[List[str]] = None,
+    ) -> RunEnrichmentResponse:
+        """
+        Trigger an enrichment or waterfall to run on table rows.
+
+        Args:
+            table_uuid: UUID of the table.
+            enrichment_id: ID of the table enrichment (from add_enrichment or add_waterfall).
+            run_strategy: 'run_all' (default), 'run_empty' (skip rows with results),
+                or 'run_errors' (only re-run rows that errored).
+            row_ids: Optional list of specific row UUIDs to process.
+        """
+        body: Dict[str, Any] = {"run_strategy": run_strategy}
+        if row_ids is not None:
+            body["row_ids"] = row_ids
+        data = self._request(
             "POST",
             f"/table/{table_uuid}/run-enrichment/{enrichment_id}",
-            params=params,
+            json=body,
         )
+        return RunEnrichmentResponse.model_validate(data)
+
+    # -----------------------------------------------------------------------
+    # Tables — Waterfalls
+    # -----------------------------------------------------------------------
+
+    def add_waterfall(
+        self,
+        table_uuid: str,
+        waterfall_identifier: str,
+        enrichments: List[int],
+        mapping: Dict[str, str],
+        email_verifier: Optional[int] = None,
+    ) -> AddWaterfallResponse:
+        """
+        Add a waterfall to a table.
+
+        Args:
+            table_uuid: UUID of the table.
+            waterfall_identifier: Waterfall slug (e.g. 'email_getter').
+            enrichments: List of enrichment (provider) IDs to use in the cascade.
+            mapping: Maps waterfall parameter names to column UUIDs or column names.
+                The API resolves names to UUIDs automatically.
+            email_verifier: Optional enrichment ID for email verification.
+
+        Returns:
+            :class:`AddWaterfallResponse` with ``id`` and ``waterfall_name``.
+            Use ``id`` with run_table_enrichment().
+        """
+        payload: Dict[str, Any] = {
+            "waterfall": waterfall_identifier,
+            "enrichments": enrichments,
+            "mapping": mapping,
+        }
+        if email_verifier is not None:
+            payload["email_verifier"] = email_verifier
+        data = self._request("POST", f"/table/{table_uuid}/add-waterfall", json=payload)
+        return AddWaterfallResponse.model_validate(data)
+
+    def get_table_waterfalls(self, table_uuid: str) -> List[InstalledWaterfall]:
+        """List waterfalls installed on a table."""
+        data = self._request("GET", f"/table/{table_uuid}/waterfalls")
+        return [InstalledWaterfall.model_validate(w) for w in data]
+
+    # -----------------------------------------------------------------------
+    # Tables — Exporters
+    # -----------------------------------------------------------------------
+
+    def add_exporter(
+        self,
+        table_uuid: str,
+        exporter_id: int,
+        mapping: Dict[str, Any],
+        launch_strategy: Literal["run_on_click", "run_on_update"] = "run_on_click",
+        authorization: Optional[int] = None,
+        custom_body_template: Optional[str] = None,
+    ) -> AddExporterResponse:
+        """
+        Add an exporter to a table.
+
+        Args:
+            table_uuid: UUID of the table.
+            exporter_id: The exporter ID (from list_exporters).
+            mapping: Parameter mapping. Keys are exporter parameter slugs. Values are
+                ``{"type": "mapping"|"simple", "value": "<column-name-or-uuid|static-value>"}``.
+            launch_strategy: 'run_on_click' (manual) or 'run_on_update' (auto-trigger).
+            authorization: ID of the API key / OAuth connection to use. Auto-selected if omitted.
+            custom_body_template: Custom JSON body template. Column values referenced via
+                {column_internal_name} placeholders. When set, mapping is ignored.
+
+        Returns:
+            :class:`AddExporterResponse` with ``id`` and ``exporter_name``.
+            Use ``id`` with run_table_enrichment().
+        """
+        payload: Dict[str, Any] = {
+            "exporter": exporter_id,
+            "mapping": mapping,
+            "launch_strategy": launch_strategy,
+        }
+        if authorization is not None:
+            payload["authorization"] = authorization
+        if custom_body_template is not None:
+            payload["custom_body_template"] = custom_body_template
+        data = self._request("POST", f"/table/{table_uuid}/add-exporter", json=payload)
+        return AddExporterResponse.model_validate(data)
+
+    def get_table_exporters(self, table_uuid: str) -> List[InstalledExporter]:
+        """List exporters installed on a table."""
+        data = self._request("GET", f"/table/{table_uuid}/exporters")
+        return [InstalledExporter.model_validate(e) for e in data]
 
     # -----------------------------------------------------------------------
     # Rows
@@ -530,20 +793,31 @@ class DatabarClient:
         table_uuid: str,
         page: int = 1,
         per_page: int = 100,
+        filter: Optional[str] = None,
     ) -> RowsResponse:
         """
-        Get rows from a table with pagination.
+        Get rows from a table with pagination and optional filtering.
 
-        Returns a :class:`RowsResponse` with ``.data`` (list of row dicts),
-        ``.has_next_page``, ``.total_count``, ``.page``.
-        Each row dict is keyed by column name and includes an ``id`` key.
+        Args:
+            table_uuid: UUID of the table.
+            page: Page number (default 1).
+            per_page: Rows per page (max 500, default 100).
+            filter: JSON-encoded filter object. Keys are column names, values are
+                operator objects. Supported operators: equals, contains, not_equals,
+                is_empty, is_not_empty.
+                Example: '{"company":{"contains":"tech"},"status":{"equals":"active"}}'
 
-        ``per_page`` max is 500 (API limit). Default is 100.
+        Returns a :class:`RowsResponse` with ``.data``, ``.has_next_page``,
+        ``.total_count``, ``.page``. Each row dict is keyed by column name and
+        includes an ``id`` key.
         """
+        params: Dict[str, Any] = {"page": page, "per_page": per_page}
+        if filter is not None:
+            params["filter"] = filter
         data = self._request(
             "GET",
             f"/table/{table_uuid}/rows",
-            params={"page": page, "per_page": per_page},
+            params=params,
         )
         return RowsResponse.model_validate(data)
 
@@ -624,3 +898,196 @@ class DatabarClient:
             all_results.extend(response.results)
 
         return UpsertResponse(results=all_results)
+
+    def delete_rows(self, table_uuid: str, row_ids: List[str]) -> None:
+        """Delete specific rows from a table by their UUIDs."""
+        self._request(
+            "POST",
+            f"/table/{table_uuid}/rows/delete",
+            json={"row_ids": row_ids},
+        )
+
+    # -----------------------------------------------------------------------
+    # Exporters
+    # -----------------------------------------------------------------------
+
+    def list_exporters(
+        self,
+        q: Optional[str] = None,
+        page: Optional[int] = None,
+        limit: int = 50,
+    ) -> Union[List[Exporter], ExporterListResponse]:
+        """
+        List available exporters (CRM/destination integrations).
+
+        Without ``page`` (default): returns a plain list of :class:`Exporter`.
+        With ``page``: returns a paginated :class:`ExporterListResponse` envelope.
+
+        Args:
+            q: Search query to filter results.
+            page: Page number for paginated results.
+            limit: Items per page (only used with page). Max 500.
+        """
+        params: Dict[str, Any] = {}
+        if q:
+            params["q"] = q
+        if page is not None:
+            params["page"] = page
+            params["limit"] = limit
+
+        data = self._request("GET", "/exporters/", params=params if params else None)
+
+        if page is not None:
+            return ExporterListResponse(
+                items=[Exporter.model_validate(e) for e in data.get("items", data)],
+                page=data["page"],
+                limit=data["limit"],
+                has_next_page=data["has_next_page"],
+                total_count=data["total_count"],
+            )
+        return [Exporter.model_validate(e) for e in data]
+
+    def get_exporter(self, exporter_id: int) -> ExporterDetail:
+        """
+        Get full details for a specific exporter, including params and authorization info.
+        """
+        data = self._request("GET", f"/exporters/{exporter_id}")
+        return ExporterDetail.model_validate(data)
+
+    # -----------------------------------------------------------------------
+    # Connectors
+    # -----------------------------------------------------------------------
+
+    def list_connectors(self) -> List[Connector]:
+        """List all custom API connectors in the workspace."""
+        data = self._request("GET", "/connectors/")
+        return [Connector.model_validate(c) for c in data]
+
+    def get_connector(self, connector_id: int) -> Connector:
+        """Get details of a specific custom API connector."""
+        data = self._request("GET", f"/connectors/{connector_id}")
+        return Connector.model_validate(data)
+
+    def create_connector(
+        self,
+        name: str,
+        method: str,
+        url: str,
+        type: str = "enrichment",
+        headers: Optional[List[Dict[str, str]]] = None,
+        parameters: Optional[List[Dict[str, str]]] = None,
+        body: Optional[List[Dict[str, str]]] = None,
+        body_template: Optional[str] = None,
+        rate_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> Connector:
+        """
+        Register a new custom HTTP API endpoint as a connector.
+
+        Once created the connector appears as an enrichment/exporter usable in tables.
+
+        Args:
+            name: Display name for the connector.
+            method: HTTP method: get, post, put, or patch.
+            url: Full API endpoint URL.
+            type: Connector type: simple, enrichment, or exporter (default enrichment).
+            headers: HTTP headers as list of {"name": ..., "value": ...} dicts.
+            parameters: Query parameters as list of {"name": ..., "value": ...} dicts.
+            body: Request body fields as list of {"name": ..., "value": ...} dicts.
+            body_template: Jinja body template. When set, body params become template vars.
+            rate_limit: Max requests per minute (capped by plan).
+            max_concurrency: Max concurrent requests (capped by plan).
+        """
+        payload: Dict[str, Any] = {
+            "name": name,
+            "method": method,
+            "url": url,
+            "type": type,
+            "headers": headers or [],
+            "parameters": parameters or [],
+            "body": body or [],
+        }
+        if body_template is not None:
+            payload["body_template"] = body_template
+        if rate_limit is not None:
+            payload["rate_limit"] = rate_limit
+        if max_concurrency is not None:
+            payload["max_concurrency"] = max_concurrency
+        data = self._request("POST", "/connectors/", json=payload)
+        return Connector.model_validate(data)
+
+    def update_connector(
+        self,
+        connector_id: int,
+        name: str,
+        method: str,
+        url: str,
+        type: str = "enrichment",
+        headers: Optional[List[Dict[str, str]]] = None,
+        parameters: Optional[List[Dict[str, str]]] = None,
+        body: Optional[List[Dict[str, str]]] = None,
+        body_template: Optional[str] = None,
+        rate_limit: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> Connector:
+        """Replace the configuration of an existing custom API connector."""
+        payload: Dict[str, Any] = {
+            "name": name,
+            "method": method,
+            "url": url,
+            "type": type,
+            "headers": headers or [],
+            "parameters": parameters or [],
+            "body": body or [],
+        }
+        if body_template is not None:
+            payload["body_template"] = body_template
+        if rate_limit is not None:
+            payload["rate_limit"] = rate_limit
+        if max_concurrency is not None:
+            payload["max_concurrency"] = max_concurrency
+        data = self._request("PUT", f"/connectors/{connector_id}", json=payload)
+        return Connector.model_validate(data)
+
+    def delete_connector(self, connector_id: int) -> None:
+        """Permanently remove a custom API connector."""
+        self._request("DELETE", f"/connectors/{connector_id}")
+
+    # -----------------------------------------------------------------------
+    # Folders
+    # -----------------------------------------------------------------------
+
+    def create_folder(self, name: str) -> Folder:
+        """Create a new folder to organize tables."""
+        data = self._request("POST", "/folders", json={"name": name})
+        return Folder.model_validate(data)
+
+    def list_folders(self) -> List[Folder]:
+        """List all folders in the workspace."""
+        data = self._request("GET", "/folders")
+        return [Folder.model_validate(f) for f in data]
+
+    def rename_folder(self, folder_id: int, name: str) -> Folder:
+        """Rename an existing folder."""
+        data = self._request("PATCH", f"/folders/{folder_id}", json={"name": name})
+        return Folder.model_validate(data)
+
+    def delete_folder(self, folder_id: int) -> None:
+        """Delete a folder. Tables in the folder are moved to the root level."""
+        self._request("DELETE", f"/folders/{folder_id}")
+
+    def move_table_to_folder(
+        self,
+        table_uuid: str,
+        folder_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Move a table into a folder, or remove it from its current folder.
+
+        Pass folder_id=None (default) to remove the table from any folder.
+        """
+        payload: Dict[str, Any] = {"table_uuid": table_uuid}
+        if folder_id is not None:
+            payload["folder_id"] = folder_id
+        data = self._request("POST", "/folders/move-table", json=payload)
+        return data or {}

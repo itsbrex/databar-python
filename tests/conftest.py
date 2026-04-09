@@ -73,6 +73,17 @@ def enrichment_payload(id: int = 1, **overrides) -> dict:
     }
 
 
+def enrichment_list_response_payload(page: int = 1, items: list | None = None, **overrides) -> dict:
+    return {
+        "items": items if items is not None else [enrichment_summary_payload(1), enrichment_summary_payload(2)],
+        "page": page,
+        "limit": 50,
+        "has_next_page": False,
+        "total_count": 2,
+        **overrides,
+    }
+
+
 def task_payload(status: str = "processing", task_id: str = "task-123", data=None) -> dict:
     return {
         "task_id": task_id,
@@ -92,6 +103,17 @@ def table_payload(identifier: str = "tbl-uuid-1", **overrides) -> dict:
     }
 
 
+def column_payload(identifier: str = "col-uuid-1", **overrides) -> dict:
+    return {
+        "identifier": identifier,
+        "internal_name": "abc123",
+        "name": "Email",
+        "type_of_value": "text",
+        "data_processor_id": None,
+        **overrides,
+    }
+
+
 def waterfall_payload(identifier: str = "email_getter", **overrides) -> dict:
     return {
         "identifier": identifier,
@@ -105,5 +127,75 @@ def waterfall_payload(identifier: str = "email_getter", **overrides) -> dict:
         ],
         "is_email_verifying": False,
         "email_verifiers": [],
+        **overrides,
+    }
+
+
+def exporter_payload(id: int = 1, **overrides) -> dict:
+    return {
+        "id": id,
+        "name": "Google Sheets",
+        "description": "Push data to Google Sheets",
+        "dataset": 42,
+        **overrides,
+    }
+
+
+def exporter_detail_payload(id: int = 1, **overrides) -> dict:
+    return {
+        **exporter_payload(id=id),
+        "params": [
+            {
+                "name": "spreadsheet_url",
+                "is_required": True,
+                "type_field": "text",
+                "description": "Google Sheets URL",
+                "choices": None,
+            }
+        ],
+        "response_fields": [
+            {"name": "status", "display_name": "Status", "type_field": "text"},
+        ],
+        "authorization": {"required": False, "connections": []},
+        **overrides,
+    }
+
+
+def exporter_list_response_payload(page: int = 1, **overrides) -> dict:
+    return {
+        "items": [exporter_payload(1), exporter_payload(2)],
+        "page": page,
+        "limit": 50,
+        "has_next_page": False,
+        "total_count": 2,
+        **overrides,
+    }
+
+
+def connector_payload(id: int = 1, **overrides) -> dict:
+    return {
+        "id": id,
+        "name": "My Scoring API",
+        "type": "enrichment",
+        "method": "post",
+        "url": "https://api.example.com/v1/score",
+        "headers": [{"name": "Authorization", "value": "Bearer sk-xxx"}],
+        "parameters": [],
+        "body": [{"name": "domain", "value": ""}],
+        "body_template": None,
+        "rate_limit": 60,
+        "max_concurrency": 5,
+        "created_at": "2025-01-15T10:30:00Z",
+        **overrides,
+    }
+
+
+def folder_payload(id: int = 1, **overrides) -> dict:
+    return {
+        "id": id,
+        "name": "My Folder",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z",
+        "table_count": 3,
         **overrides,
     }
