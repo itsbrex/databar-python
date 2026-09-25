@@ -175,6 +175,49 @@ def test_login_saves_key(tmp_path, monkeypatch):
     assert "my-secret-key" in config_file.read_text()
 
 
+def test_login_oauth_saves_key(tmp_path, monkeypatch):
+    config_file = tmp_path / "config"
+    monkeypatch.setattr("databar.cli._auth.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("databar.cli._auth.CONFIG_FILE", config_file)
+    monkeypatch.setattr(
+        "databar.cli._oauth.run_browser_login",
+        lambda print_url=None: {"api_key": "oauth-key", "email": "ada@example.com"},
+    )
+    result = runner.invoke(app, ["login"])
+    assert result.exit_code == 0
+    assert "ada@example.com" in result.output
+    assert "api_key=oauth-key" in config_file.read_text()
+
+
+def test_login_oauth_preserves_other_config_lines(tmp_path, monkeypatch):
+    config_file = tmp_path / "config"
+    config_file.write_text("preferred_interface=cli\napi_key=old\n")
+    monkeypatch.setattr("databar.cli._auth.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("databar.cli._auth.CONFIG_FILE", config_file)
+    monkeypatch.setattr(
+        "databar.cli._oauth.run_browser_login",
+        lambda print_url=None: {"api_key": "new-key", "email": "ada@example.com"},
+    )
+    result = runner.invoke(app, ["login"])
+    assert result.exit_code == 0
+    text = config_file.read_text()
+    assert "api_key=new-key" in text
+    assert "preferred_interface=cli" in text
+    assert "api_key=old" not in text
+
+
+def test_logout_removes_key(tmp_path, monkeypatch):
+    config_file = tmp_path / "config"
+    config_file.write_text("api_key=secret\npreferred_interface=cli\n")
+    monkeypatch.setattr("databar.cli._auth.CONFIG_DIR", tmp_path)
+    monkeypatch.setattr("databar.cli._auth.CONFIG_FILE", config_file)
+    result = runner.invoke(app, ["logout"])
+    assert result.exit_code == 0
+    text = config_file.read_text()
+    assert "api_key=" not in text
+    assert "preferred_interface=cli" in text
+
+
 def test_whoami_table(monkeypatch):
     mock = _client_mock()
     monkeypatch.setattr("databar.cli._auth.get_client", lambda: mock)

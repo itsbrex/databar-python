@@ -32,7 +32,8 @@ databar whoami --format json    # verify
 ```
 
 **Never run `databar onboard`** — that is an interactive wizard for humans, not agents.  
-**Never run `databar login` without `--api-key`** — it will hang waiting for terminal input.
+**Never run `databar login` without `--api-key`** — it opens a browser OAuth
+flow that agents cannot complete. Always pass the key non-interactively.
 
 ---
 

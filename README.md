@@ -26,7 +26,8 @@ Get your API key from [databar.ai](https://databar.ai) → **Integrations**.
 ```bash
 databar login
 ```
-Saves your key to `~/.databar/config`.
+Opens the browser to sign in and saves your workspace API key to `~/.databar/config`.
+For CI or agents, use `databar login --api-key <key>` instead.
 
 **Option 2 — Environment variable:**
 ```bash
@@ -368,7 +369,9 @@ After installing, the `databar` command is available in your terminal.
 ### Authentication
 
 ```bash
-databar login              # save API key interactively
+databar login              # browser OAuth → save API key
+databar login --api-key …  # paste a key (CI / agents)
+databar logout             # remove saved key
 databar whoami             # show name, email, balance, plan
 databar whoami --format json
 ```
